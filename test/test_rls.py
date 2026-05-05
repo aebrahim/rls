@@ -248,16 +248,12 @@ class SyncRLSTests(unittest.TestCase):
         rls_sess2.close()
 
     def test_none_context_field_clears_rls_setting(self):
-        """A nullable pydantic field set to None resets the corresponding RLS pg setting."""
+        """A nullable pydantic field set to None filters all rows."""
         context = models.SampleRlsContext(account_id=None)
         rls_sess = rls_session.RlsSession(context=context, bind=self.engine)
         with rls_sess.begin():
-            setting = rls_setting(rls_sess, "account_id")
-            self.assertEqual(
-                setting,
-                "",
-                "RLS setting for a None context field must be reset to empty string.",
-            )
+            rows = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(rows, [], "Expected no rows when account_id is None.")
         rls_sess.close()
 
     def test_none_context_field_filters_results(self):
@@ -356,13 +352,6 @@ class SyncRLSTests(unittest.TestCase):
         self.assertFalse(rls_bypassed(rls_sess))
         rls_sess.close()
 
-    def test_begin_sets_rls_account_id_setting(self):
-        """begin() sets the rls.account_id pg setting to the context value."""
-        rls_sess = self._new_session(account_id=1)
-        with rls_sess.begin():
-            self.assertEqual(rls_setting(rls_sess, "account_id"), "1")
-        rls_sess.close()
-
     def test_scalar_sets_rls_settings(self):
         """scalar() applies RLS and returns only the account's user id."""
         rls_sess = self._new_session(account_id=1)
@@ -382,7 +371,6 @@ class SyncRLSTests(unittest.TestCase):
         rls_sess = self._new_session(account_id=1)
         with rls_sess.begin():
             rls_sess.flush()
-            self.assertEqual(rls_setting(rls_sess, "account_id"), "1")
             result = list(rls_sess.execute(_USER_ID_QUERY).scalars())
             self.assertEqual(result, [1])
         rls_sess.close()
@@ -391,7 +379,6 @@ class SyncRLSTests(unittest.TestCase):
         """begin() sets rls.account_id and ORM User query returns only the account's user."""
         rls_sess = self._new_session(account_id=1)
         with rls_sess.begin():
-            self.assertEqual(rls_setting(rls_sess, "account_id"), "1")
             users = list(
                 rls_sess.scalars(
                     sqlalchemy.select(models.User).order_by(models.User.id)
@@ -448,7 +435,6 @@ class SyncRLSTests(unittest.TestCase):
             )
             self.assertEqual([u.id for u in users], [1])
             rls_sess.flush()
-            self.assertEqual(rls_setting(rls_sess, "account_id"), "1")
             users_after_flush = list(
                 rls_sess.scalars(
                     sqlalchemy.select(models.User).order_by(models.User.id)
@@ -492,6 +478,151 @@ class SyncRLSTests(unittest.TestCase):
                 0,
                 "Public schema tables must still exist after a context with a malicious value.",
             )
+
+    def test_begin_returns_rls_session_transaction(self):
+        """begin() returns an RlsSessionTransaction, not the session itself."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            self.assertIsInstance(tx, rls_session.RlsSessionTransaction)
+            self.assertNotIsInstance(tx, rls_session.RlsSession)
+        rls_sess.close()
+
+    def test_transaction_session_property(self):
+        """The transaction's .session property points back at the owning RlsSession."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            self.assertIs(tx.session, rls_sess)
+        rls_sess.close()
+
+    def test_transaction_is_active_inside_block(self):
+        """is_active is True while the transaction is open."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            self.assertTrue(tx.is_active)
+        rls_sess.close()
+
+    def test_transaction_nested_is_false(self):
+        """A regular begin() transaction is not nested (no SAVEPOINT)."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            self.assertFalse(tx.nested)
+        rls_sess.close()
+
+    def test_transaction_parent_is_none(self):
+        """A top-level begin() transaction has no parent."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            self.assertIsNone(tx.parent)
+        rls_sess.close()
+
+    def test_rls_filtering_through_transaction(self):
+        """Queries executed via the session within a transaction block apply RLS."""
+        rls_sess = self._new_session(account_id=1)
+        with rls_sess.begin():
+            result = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(result, [1])
+        rls_sess.close()
+
+    def test_transaction_explicit_commit_sets_dirty(self):
+        """Calling tx.commit() inside the block marks the session as dirty."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            rls_sess._rls_dirty = False
+            tx.commit()
+            self.assertTrue(rls_sess._rls_dirty)
+        rls_sess.close()
+
+    def test_transaction_explicit_rollback_sets_dirty(self):
+        """Calling tx.rollback() inside the block marks the session as dirty."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            rls_sess._rls_dirty = False
+            tx.rollback()
+            self.assertTrue(rls_sess._rls_dirty)
+        rls_sess.close()
+
+    def test_transaction_context_exit_commit_sets_dirty(self):
+        """Normal context-manager exit (implicit commit) marks the session as dirty."""
+        rls_sess = self._new_session()
+        with rls_sess.begin():
+            rls_sess._rls_dirty = False
+        self.assertTrue(rls_sess._rls_dirty)
+        rls_sess.close()
+
+    def test_transaction_context_exit_rollback_on_exception_sets_dirty(self):
+        """Context-manager exit with an exception (implicit rollback) marks dirty."""
+        rls_sess = self._new_session()
+        with self.assertRaises(ValueError):
+            with rls_sess.begin():
+                rls_sess._rls_dirty = False
+                raise ValueError("boom")
+        self.assertTrue(rls_sess._rls_dirty)
+        rls_sess.close()
+
+    def test_rls_reapplied_after_transaction_commit(self):
+        """After an explicit tx.commit(), a new begin() still applies RLS."""
+        rls_sess = self._new_session(account_id=1)
+        with rls_sess.begin():
+            result = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(result, [1])
+        with rls_sess.begin():
+            result = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(result, [1])
+        rls_sess.close()
+
+    def test_rls_reapplied_after_transaction_rollback_on_error(self):
+        """After an exception rolls back the transaction, a new begin() still applies RLS."""
+        rls_sess = self._new_session(account_id=1)
+        with self.assertRaises(ValueError):
+            with rls_sess.begin():
+                raise ValueError("test")
+        with rls_sess.begin():
+            result = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(result, [1])
+        rls_sess.close()
+
+    def test_bypass_rls_within_transaction(self):
+        """bypass_rls inside a transaction block still works correctly."""
+        rls_sess = self._new_session(account_id=1)
+        with rls_sess.begin():
+            with rls_sess.bypass_rls():
+                result = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+                self.assertEqual(result, [1, 2])
+            result = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(result, [1])
+        rls_sess.close()
+
+    def test_different_accounts_via_transaction(self):
+        """Two sessions with different contexts see different data."""
+        rls_sess1 = self._new_session(account_id=1)
+        rls_sess2 = self._new_session(account_id=2)
+        with rls_sess1.begin():
+            with rls_sess2.begin():
+                r1 = list(rls_sess1.execute(_USER_ID_QUERY).scalars())
+                r2 = list(rls_sess2.execute(_USER_ID_QUERY).scalars())
+                self.assertEqual(r1, [1])
+                self.assertEqual(r2, [2])
+        rls_sess1.close()
+        rls_sess2.close()
+
+    def test_transaction_close_delegates(self):
+        """tx.close() delegates to the underlying SessionTransaction."""
+        rls_sess = self._new_session()
+        with rls_sess.begin() as tx:
+            tx.close()
+        rls_sess.close()
+
+    def test_transaction_mutable_context_reapplied(self):
+        """Changing a mutable context mid-transaction re-applies RLS."""
+        context = models.SampleRlsContext(account_id=1)
+        rls_sess = rls_session.RlsSession(context=context, bind=self.engine)
+        with rls_sess.begin():
+            first = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(first, [1])
+            context.account_id = 2
+            second = list(rls_sess.execute(_USER_ID_QUERY).scalars())
+            self.assertEqual(second, [2])
+        rls_sess.close()
 
 
 if __name__ == "__main__":
