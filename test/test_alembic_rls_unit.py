@@ -563,6 +563,31 @@ class TestCompareTableLevel(unittest.TestCase):
         ]
         self.assertEqual(len(enable_ops), 1)
 
+    def test_no_enable_rls_when_table_has_empty_policies(self):
+        """A table present in rls_policies with an empty list must not get ENABLE ROW LEVEL SECURITY."""
+        modify_ops = self._build_context(
+            table_exists=True,
+            rls_enabled=False,
+            meta_policies={"users": []},
+        )
+        enable_ops = [
+            op for op in modify_ops.ops if isinstance(op, alembic_rls.EnableRlsOp)
+        ]
+        self.assertEqual(len(enable_ops), 0)
+
+    def test_disable_rls_when_table_has_empty_policies_but_rls_enabled_in_db(self):
+        """When the DB has RLS enabled but the metadata has an empty policy list, DISABLE ROW LEVEL SECURITY must be issued."""
+        modify_ops = self._build_context(
+            table_exists=True,
+            rls_enabled=True,
+            db_policies=[],
+            meta_policies={"users": []},
+        )
+        disable_ops = [
+            op for op in modify_ops.ops if isinstance(op, alembic_rls.DisableRlsOp)
+        ]
+        self.assertEqual(len(disable_ops), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
