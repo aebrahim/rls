@@ -624,6 +624,62 @@ class SyncRLSTests(unittest.TestCase):
             self.assertEqual(second, [2])
         rls_sess.close()
 
+    def test_two_phase_commit_with_update(self):
+        """Two-phase commit (prepare + commit) with an UPDATE restricted by RLS.
+
+        The UPDATE targets all rows; RLS (account_id=1) silently restricts the
+        write to the single matching row.  The follow-up SELECT also uses no
+        WHERE clause — RLS is solely responsible for returning only that row.
+        """
+        # No WHERE clause: without RLS this would update both users.
+        # Use id-based value to avoid a unique-constraint violation if RLS
+        # unexpectedly allows both rows to be modified.
+        update_stmt = sqlalchemy.text(
+            "UPDATE users SET username = 'twophase_' || id::text"
+        )
+        rls_sess = session.RlsSession(
+            context=models.SampleRlsContext(account_id=1),
+            bind=self.engine,
+            twophase=True,
+        )
+        rls_sess_acct2 = session.RlsSession(
+            context=models.SampleRlsContext(account_id=2),
+            bind=self.engine,
+        )
+        try:
+            with rls_sess.begin():
+                # RLS limits the UPDATE to the row where id = 1.
+                rows_updated = rls_sess.execute(update_stmt).rowcount
+                self.assertEqual(rows_updated, 1)
+                rls_sess.prepare()  # First phase of two-phase commit
+                rls_sess.commit()  # Second phase of two-phase commit
+            with rls_sess.begin():
+                # No WHERE clause: RLS restricts the result to account_id=1.
+                usernames = list(
+                    rls_sess.execute(
+                        sqlalchemy.text("SELECT username FROM users")
+                    ).scalars()
+                )
+            self.assertEqual(usernames, ["twophase_1"])
+            # Verify account_id=2's row was not affected by the UPDATE.
+            with rls_sess_acct2.begin():
+                usernames_acct2 = list(
+                    rls_sess_acct2.execute(
+                        sqlalchemy.text("SELECT username FROM users")
+                    ).scalars()
+                )
+            self.assertEqual(usernames_acct2, ["user2"])
+        finally:
+            rls_sess.close()
+            rls_sess_acct2.close()
+            with self.instance.admin_engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(
+                        sqlalchemy.text(
+                            "UPDATE users SET username = 'user1' WHERE id = 1"
+                        )
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
